@@ -31,24 +31,34 @@
 param (
   [string]$acctkey,
   [string]$orgkey,
+  [string]$tags,
   [switch]$reregister,
   [switch]$reinstall,
   [switch]$uninstall, 
   [switch]$repair
 )
 
+$TagsKey = "__TAGS__"
+if ($env:HUNTRESS_TAGS) {
+    $TagsKey = $env:HUNTRESS_TAGS
+}
 
 # The account key should be stored in the DattoRMM account variable HUNTRESS_ACCOUNT_KEY
 $AccountKey = "__ACCOUNT_KEY__"
 if ($env:HUNTRESS_ACCOUNT_KEY) {
     $AccountKey = $env:HUNTRESS_ACCOUNT_KEY
 }
-
 # Use the CS_PROFILE_NAME environment variable as the OrganizationKey
 # This should always be set by the DattoRMM agent. If not, there is likely
 # an issue with the agent.
 $OrganizationKey = $env:CS_PROFILE_NAME
 if (!$env:CS_PROFILE_NAME) { $OrganizationKey = 'MISSING_CS_PROFILE_NAME' }
+
+
+##############################################################################
+## Begin user modified variables
+##############################################################################
+
 
 # Set to "Continue" to enable verbose logging.
 $DebugPreference = "SilentlyContinue"
@@ -68,8 +78,8 @@ $estimatedSpaceNeeded = 200111222
 ##############################################################################
 
 # These are used by the Huntress support team when troubleshooting.
-$ScriptVersion = "Version 2, major revision 8, 2023 Jul 24, "
-$ScriptType = "DattoRMM"
+$ScriptVersion = "Version 2, major revision 7, 2024 January 24"
+$ScriptType = "PowerShell"
 
 # variables used throughout this script
 $X64 = 64
@@ -120,6 +130,10 @@ if ( ! [string]::IsNullOrEmpty($orgkey) ) {
     $OrganizationKey = $orgkey
 }
 
+# Check for tags specified on the command line.
+if ( ! [string]::IsNullOrEmpty($tags) ) {
+    $TagsKey = $tags
+}
 
 # pick the appropriate file to download based on the OS version
 if ($LegacyCommandsRequired -eq $true) {
@@ -208,6 +222,33 @@ function Test-Parameters {
     LogMessage "Parameters verified."
 }
 
+# Force kill a process by process name
+function KillProcessByName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProcessName
+    )
+
+    $processes = Get-Process | Where-Object { $_.ProcessName -eq $ProcessName }
+    $processCount = $processes | Measure-Object | Select-Object -ExpandProperty Count
+
+    if ($processCount -eq 0) {
+        LogMessage "No processes with the name '$ProcessName' are currently running."
+    }
+    else {
+        foreach ($process in $processes) {
+            try {
+                $processID = $process.Id
+                Stop-Process -Id $processID -Force
+                LogMessage "Killed process '$ProcessName' (ID $processID) successfully."
+            }
+            catch {
+                LogMessage "Failed to kill process '$ProcessName' (ID $processID): $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
 # check to see if the Huntress service exists (agent or updater)
 function Confirm-ServiceExists ($service) {
     if (Get-Service $service -ErrorAction SilentlyContinue) {
@@ -257,6 +298,17 @@ function verifyInstaller ($file) {
     }
 }
 
+# Prevent conflicting file from preventing creation of installation directory.
+function prepareAgentPath {
+    $path = getAgentPath
+    if (Test-Path $path -PathType Leaf) {
+        $backup = "$path.bak"
+        $err = "WARNING: '$path' already exists and is not a directory, renaming to '$backup'."
+        Write-Output $err -ForegroundColor white -BackgroundColor red
+        Rename-Item -Path $path -NewName $backup -Force
+    }
+}
+
 # download the Huntress installer
 function Get-Installer {
     $msg = "Downloading installer to '$InstallerPath'..."
@@ -285,24 +337,35 @@ function Get-Installer {
         }
     }
 
-    # Attempt to download the correct installer for the given OS, throw error if it fails
-    $WebClient = New-Object System.Net.WebClient
-    try {
-        $WebClient.DownloadFile($DownloadURL, $InstallerPath)
-    } catch {
-        $msg = $_.Exception.Message
-        $err = "ERROR: Failed to download the Huntress Installer. Try accessing $($DownloadURL) from the host where the download failed. Contact support@huntress.io if the problem persists"
-        LogMessage $msg
-        LogMessage "$($err)  Please contact support@huntress.io if the problem persists"
-        throw $ScriptFailed + " " + $err + " " + $msg
+    # Delete stale installer before downloading the most recent installer
+    if (Test-Path $InstallerPath -PathType Leaf) {
+        $err = "WARNING: '$InstallerPath' already exists, deleting stale Huntress Installer."
+        LogMessage $err
+        Remove-Item -Path $InstallerPath -Force -ErrorAction SilentlyContinue
+    }
+
+    # Attempt to download the correct installer for the given OS, retry if it fails
+    $attempts = 6
+    $delay = 60
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        $WebClient = New-Object System.Net.WebClient
+        try {
+            $WebClient.DownloadFile($DownloadURL, $InstallerPath)
+            break
+        } catch {
+            $msg = $_.Exception.Message
+            $err = "WARNING: Failed to download the Huntress Installer ($attempt/$attempts), retrying in $delay seconds."
+            LogMessage $msg
+            LogMessage $err
+            Start-Sleep -Seconds $delay
+        }
     }
 
     # Ensure the file downloaded correctly, if not, throw error
     if ( ! (Test-Path $InstallerPath) ) {
-        $err = "ERROR: Failed to download the Huntress Installer from $DownloadURL. Suggest testing the URL in a browser."
+        $err = "ERROR: Failed to download the Huntress Installer. Try accessing $($DownloadURL) from the host where the download failed. Please contact support@huntress.io if the problem persists."
         LogMessage $err
-        LogMessage $SupportMessage
-        throw $ScriptFailed + " " + $err + " " + $SupportMessage
+        throw $ScriptFailed + " " + $err
     }
 
     $msg = "Installer downloaded to '$InstallerPath'..."
@@ -328,8 +391,13 @@ function Install-Huntress ($OrganizationKey) {
     verifyInstaller($InstallerPath)
 
     LogMessage "Executing installer..."
-   
-    $process = Start-Process $InstallerPath "/ACCT_KEY=`"$AccountKey`" /ORG_KEY=`"$OrganizationKey`" /S" -PassThru
+    prepareAgentPath
+    # if $Tags value exists install using the provided tags, otherwise no tags
+    if (($Tags) -or ($TagsKey -ne "__TAGS__")) {
+        $process = Start-Process $InstallerPath "/ACCT_KEY=`"$AccountKey`" /ORG_KEY=`"$OrganizationKey`" /TAGS=`"$TagsKey`" /S" -PassThru
+    } else {
+        $process = Start-Process $InstallerPath "/ACCT_KEY=`"$AccountKey`" /ORG_KEY=`"$OrganizationKey`" /S" -PassThru
+    }
 
     try {
         $process | Wait-Process -Timeout $timeout -ErrorAction Stop
@@ -373,7 +441,7 @@ function Test-Installation {
         Start-Sleep -Milliseconds 250
     }
     if ( ! $didAgentRegister) {
-        $err = "WARNING: It does not appear the agent has succesfully registered. Check 3rd party AV exclusion lists to ensure Huntress is excluded."
+        $err = "WARNING: It does not appear the agent has successfully registered. Check 3rd party AV exclusion lists to ensure Huntress is excluded."
         Write-Output $err -ForegroundColor white -BackgroundColor red
         LogMessage ($err + $SupportMessage)
     }
@@ -519,7 +587,7 @@ function checkFreeDiskSpace {
         $freeSpace = (Get-WmiObject -query "Select * from Win32_LogicalDisk where DeviceID='c:'" | Select-Object FreeSpace).FreeSpace
     } catch {
         LogMessage "WMI issues discovered (free space query), attempting to fix the repository"
-        winmgt -verifyrepository
+        winmgmt -verifyrepository
         $drives = get-psdrive
         foreach ($drive in $drives) {
             if ($drive.Name -eq "C") { 
@@ -586,6 +654,11 @@ function uninstallHuntress {
     Stop-Service "huntressrio" -ErrorAction SilentlyContinue
     Stop-Service "huntressupdater" -ErrorAction SilentlyContinue
     Stop-Service "huntressagent" -ErrorAction SilentlyContinue
+
+    # Force kill the executables so they're not hangin around
+    KillProcessByName "HuntressAgent.exe"
+    KillProcessByName "HuntressUpdater.exe"
+    KillProcessByName "HuntressRio.exe"
 
     # attempt to use the built in uninstaller, if not found use the uninstallers built into the Agent and Updater
     if (Test-Path $agentPath) {
@@ -733,7 +806,7 @@ function logInfo {
     try {  $os = (get-WMiObject -computername $env:computername -Class win32_operatingSystem).caption.Trim()
     } catch {
         LogMessage "WMI issues discovered (computer name query), attempting to fix the repository"
-        winmgt -verifyrepository
+        winmgmt -verifyrepository
         $os = (get-itemproperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name ProductName).ProductName
     }
     #LogMessage "Host OS: '$os'"
@@ -808,9 +881,15 @@ function copyLogAndExit {
     Start-Sleep 1
     $agentPath = getAgentPath
     $logLocation = Join-Path $agentPath "HuntressPoShInstaller.log"
-    if (!(Test-Path -path $agentPath)) {New-Item $agentPath -Type Directory}
-    Copy-Item -Path $DebugLog -Destination $logLocation -Force
-    Write-Output "$($DebugLog) copied to $agentPath"
+    
+    # If this is an unistall, we'll leave the log in the C:\temp dir otherwise,
+    # we'll copy the log to the huntress directory
+    if (!$uninstall){
+        if (!(Test-Path -path $agentPath)) {New-Item $agentPath -Type Directory}
+        Copy-Item -Path $DebugLog -Destination $logLocation -Force
+        Write-Output "'$($DebugLog)' copied to '$logLocation'."
+    }
+
     Write-Output "Script complete"
     exit 0
 }
@@ -820,6 +899,19 @@ function copyLogAndExit {
 #                                  begin main function                                  #
 #########################################################################################
 function main () {
+    if ($env:repairAgent -eq $true) {
+        $repair = $true
+    }
+    if ($env:reregisterAgent -eq $true) {
+        $reregister = $true
+    }
+    if ($env:uninstallAgent -eq $true) {
+        $uninstall = $true
+    }
+    if ($env:reinstallAgent -eq $true) {
+        $reinstall = $true
+    }
+
     # Start the script with logging as much as we can as soon as we can. All your logging are belong to us, Zero Wang.
     logInfo
 
@@ -873,6 +965,7 @@ function main () {
         $masked = $AccountKey.Substring(0,4) + "************************" + $AccountKey.SubString(28,4)
         LogMessage "AccountKey: '$masked'"
         LogMessage "OrganizationKey: '$OrganizationKey'"
+        LogMessage "Tags: $($Tags)"
     }
 
     # reregister > reinstall > uninstall > install (in decreasing order of impact)

@@ -70,7 +70,7 @@ $estimatedSpaceNeeded = 200111222
 ##############################################################################
 
 # These are used by the Huntress support team when troubleshooting.
-$ScriptVersion = "Version 2, major revision 7, 2023 May 1, "
+$ScriptVersion = "Version 2, major revision 7, 2024 January 24"
 $ScriptType = "PowerShell"
 
 # variables used throughout this script
@@ -214,6 +214,33 @@ function Test-Parameters {
     LogMessage "Parameters verified."
 }
 
+# Force kill a process by process name
+function KillProcessByName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProcessName
+    )
+
+    $processes = Get-Process | Where-Object { $_.ProcessName -eq $ProcessName }
+    $processCount = $processes | Measure-Object | Select-Object -ExpandProperty Count
+
+    if ($processCount -eq 0) {
+        LogMessage "No processes with the name '$ProcessName' are currently running."
+    }
+    else {
+        foreach ($process in $processes) {
+            try {
+                $processID = $process.Id
+                Stop-Process -Id $processID -Force
+                LogMessage "Killed process '$ProcessName' (ID $processID) successfully."
+            }
+            catch {
+                LogMessage "Failed to kill process '$ProcessName' (ID $processID): $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
 # check to see if the Huntress service exists (agent or updater)
 function Confirm-ServiceExists ($service) {
     if (Get-Service $service -ErrorAction SilentlyContinue) {
@@ -263,6 +290,17 @@ function verifyInstaller ($file) {
     }
 }
 
+# Prevent conflicting file from preventing creation of installation directory.
+function prepareAgentPath {
+    $path = getAgentPath
+    if (Test-Path $path -PathType Leaf) {
+        $backup = "$path.bak"
+        $err = "WARNING: '$path' already exists and is not a directory, renaming to '$backup'."
+        Write-Output $err -ForegroundColor white -BackgroundColor red
+        Rename-Item -Path $path -NewName $backup -Force
+    }
+}
+
 # download the Huntress installer
 function Get-Installer {
     $msg = "Downloading installer to '$InstallerPath'..."
@@ -291,24 +329,35 @@ function Get-Installer {
         }
     }
 
-    # Attempt to download the correct installer for the given OS, throw error if it fails
-    $WebClient = New-Object System.Net.WebClient
-    try {
-        $WebClient.DownloadFile($DownloadURL, $InstallerPath)
-    } catch {
-        $msg = $_.Exception.Message
-        $err = "ERROR: Failed to download the Huntress Installer. Try accessing $($DownloadURL) from the host where the download failed. Contact support@huntress.io if the problem persists"
-        LogMessage $msg
-        LogMessage "$($err)  Please contact support@huntress.io if the problem persists"
-        throw $ScriptFailed + " " + $err + " " + $msg
+    # Delete stale installer before downloading the most recent installer
+    if (Test-Path $InstallerPath -PathType Leaf) {
+        $err = "WARNING: '$InstallerPath' already exists, deleting stale Huntress Installer."
+        LogMessage $err
+        Remove-Item -Path $InstallerPath -Force -ErrorAction SilentlyContinue
+    }
+
+    # Attempt to download the correct installer for the given OS, retry if it fails
+    $attempts = 6
+    $delay = 60
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        $WebClient = New-Object System.Net.WebClient
+        try {
+            $WebClient.DownloadFile($DownloadURL, $InstallerPath)
+            break
+        } catch {
+            $msg = $_.Exception.Message
+            $err = "WARNING: Failed to download the Huntress Installer ($attempt/$attempts), retrying in $delay seconds."
+            LogMessage $msg
+            LogMessage $err
+            Start-Sleep -Seconds $delay
+        }
     }
 
     # Ensure the file downloaded correctly, if not, throw error
     if ( ! (Test-Path $InstallerPath) ) {
-        $err = "ERROR: Failed to download the Huntress Installer from $DownloadURL. Suggest testing the URL in a browser."
+        $err = "ERROR: Failed to download the Huntress Installer. Try accessing $($DownloadURL) from the host where the download failed. Please contact support@huntress.io if the problem persists."
         LogMessage $err
-        LogMessage $SupportMessage
-        throw $ScriptFailed + " " + $err + " " + $SupportMessage
+        throw $ScriptFailed + " " + $err
     }
 
     $msg = "Installer downloaded to '$InstallerPath'..."
@@ -334,6 +383,7 @@ function Install-Huntress ($OrganizationKey) {
     verifyInstaller($InstallerPath)
 
     LogMessage "Executing installer..."
+    prepareAgentPath
     # if $Tags value exists install using the provided tags, otherwise no tags
     if (($Tags) -or ($TagsKey -ne "__TAGS__")) {
         $process = Start-Process $InstallerPath "/ACCT_KEY=`"$AccountKey`" /ORG_KEY=`"$OrganizationKey`" /TAGS=`"$TagsKey`" /S" -PassThru
@@ -529,7 +579,7 @@ function checkFreeDiskSpace {
         $freeSpace = (Get-WmiObject -query "Select * from Win32_LogicalDisk where DeviceID='c:'" | Select-Object FreeSpace).FreeSpace
     } catch {
         LogMessage "WMI issues discovered (free space query), attempting to fix the repository"
-        winmgt -verifyrepository
+        winmgmt -verifyrepository
         $drives = get-psdrive
         foreach ($drive in $drives) {
             if ($drive.Name -eq "C") { 
@@ -596,6 +646,11 @@ function uninstallHuntress {
     Stop-Service "huntressrio" -ErrorAction SilentlyContinue
     Stop-Service "huntressupdater" -ErrorAction SilentlyContinue
     Stop-Service "huntressagent" -ErrorAction SilentlyContinue
+
+    # Force kill the executables so they're not hangin around
+    KillProcessByName "HuntressAgent.exe"
+    KillProcessByName "HuntressUpdater.exe"
+    KillProcessByName "HuntressRio.exe"
 
     # attempt to use the built in uninstaller, if not found use the uninstallers built into the Agent and Updater
     if (Test-Path $agentPath) {
@@ -702,23 +757,60 @@ function testNetworkConnectivity {
     # number of URL's that can fail the connectivity before the agent refuses to install (the test fails incorrectly sometimes, so 1 failure is acceptable)
     $connectivityTolerance = 1
 
-    $URLs = @("huntress.io", "huntresscdn.com", "update.huntress.io", "eetee.huntress.io", "huntress-installers.s3.amazonaws.com", "huntress-updates.s3.amazonaws.com", "huntress-uploads.s3.us-west-2.amazonaws.com",
-              "huntress-user-uploads.s3.amazonaws.com", "huntress-rio.s3.amazonaws.com", "huntress-survey-results.s3.amazonaws.com")
+    $file_name = "96bca0cef10f45a8f7cf68c4485f23a4.txt"
+
+    $URLs = @(("https://eetee.huntress.io/{0}"-f $file_name),
+	("https://huntress-installers.s3.us-east-1.amazonaws.com/agent/connectivity/{0}" -f $file_name),
+	("https://huntress-rio.s3.amazonaws.com/agent/connectivity/{0}" -f $file_name),
+	("https://huntress-survey-results.s3.amazonaws.com/agent/connectivity/{0}" -f $file_name),
+	("https://huntress-updates.s3.amazonaws.com/agent/connectivity/{0}" -f $file_name),
+	("https://huntress-uploads.s3.us-west-2.amazonaws.com/agent/connectivity/{0}" -f $file_name),
+	("https://huntress-user-uploads.s3.amazonaws.com/agent/connectivity/{0}" -f $file_name),
+	("https://huntress.io/agent/connectivity/{0}" -f $file_name),
+	("https://huntresscdn.com/agent/connectivity/{0}" -f $file_name),
+	("https://update.huntress.io/agent/connectivity/{0}" -f $file_name))
+
     foreach ($URL in $URLs) {
-        if (! (Test-NetConnection $URL -Port 443).TcpTestSucceeded) {
+        $StatusCode = 0
+        try
+        {
+            $Response = Invoke-WebRequest -Uri $URL -TimeoutSec 5 -ErrorAction Stop -ContentType "text/plain"
+            # This will only execute if the Invoke-WebRequest is successful.
+            $StatusCode = $Response.StatusCode
+
+            # Convert from bytes, if necessary
+            if ($Response.Content.GetType() -eq [System.Byte[]]) {
+                $StrContent = [System.Text.Encoding]::UTF8.GetString($Response.Content)    
+            }else {
+                $StrContent = $Response.Content.ToString().Trim()
+            }
+
+            # Remove all newlines from the content
+            $StrContent = [string]::join("",($StrContent.Split("`n")))
+            
+
+            $ContentMatch = $StrContent -eq "96bca0cef10f45a8f7cf68c4485f23a4"
+        } catch {
+            LogMessage "Error: $($_.Exception.Message)"
+        }
+
+        if ($StatusCode -ne 200) {
             $err = "WARNING, connectivity to Huntress URL's is being interrupted. You MUST open port 443 for $($URL) in order for the Huntress agent to function."
-            Write-Output $err -ForegroundColor white -BackgroundColor red
-            LogMessage $err
+            LogMessage $err 
             $connectivityTolerance --
+        } elseif (!$ContentMatch) {
+            $err = "WARNING, successful connection to Huntress URL, however, content did not match expected. Ensure no proxy or content filtering is preventing access!"
+            LogMessage $err 
+            $connectivityTolerance --
+            LogMessage "Content: $($StrContent)"
         } else {
-            LogMessage "Connection succeeded to $($URL) on port 443!"
+            LogMessage "Connection succeeded to $($URL)"
         }
     }
     if ($connectivityTolerance -lt 0) {
         Write-Output "Please fix the closed port 443 for the above domains before attempting to install" -ForegroundColor white -BackgroundColor red
         $err = "Too many connections failed $($connectivityTolerance), exiting"
-        LogMessage $err
-        Write-Output "$($err), $($SupportMessage)" -ForegroundColor white -BackgroundColor red
+        LogMessage "$($err), $($SupportMessage)" 
         return $false
     }
     return $true
@@ -743,7 +835,7 @@ function logInfo {
     try {  $os = (get-WMiObject -computername $env:computername -Class win32_operatingSystem).caption.Trim()
     } catch {
         LogMessage "WMI issues discovered (computer name query), attempting to fix the repository"
-        winmgt -verifyrepository
+        winmgmt -verifyrepository
         $os = (get-itemproperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name ProductName).ProductName
     }
     #LogMessage "Host OS: '$os'"
@@ -806,7 +898,9 @@ function logInfo {
     }
 
     $areURLsAvailable = testNetworkConnectivity
-    if ( ! $areURLsAvailable) {
+    if ( $areURLsAvailable) {
+        LogMessage "Network Connectivity verified!"
+    } else {
         copyLogAndExit
     }
 
@@ -818,9 +912,15 @@ function copyLogAndExit {
     Start-Sleep 1
     $agentPath = getAgentPath
     $logLocation = Join-Path $agentPath "HuntressPoShInstaller.log"
-    if (!(Test-Path -path $agentPath)) {New-Item $agentPath -Type Directory}
-    Copy-Item -Path $DebugLog -Destination $logLocation -Force
-    Write-Output "$($DebugLog) copied to $agentPath"
+    
+    # If this is an unistall, we'll leave the log in the C:\temp dir otherwise,
+    # we'll copy the log to the huntress directory
+    if (!$uninstall){
+        if (!(Test-Path -path $agentPath)) {New-Item $agentPath -Type Directory}
+        Copy-Item -Path $DebugLog -Destination $logLocation -Force
+        Write-Output "'$($DebugLog)' copied to '$logLocation'."
+    }
+
     Write-Output "Script complete"
     exit 0
 }
