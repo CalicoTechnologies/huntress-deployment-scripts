@@ -1,4 +1,3 @@
-### TEST
 @echo off
 
 rem This batch file was created as a wrapper for RMM tools that support Powershell scripts, but don't give the option to control the
